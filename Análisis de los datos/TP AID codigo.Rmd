@@ -1,0 +1,518 @@
+---
+title: "TP AID"
+author: "Matías Poullain"
+date: "16/7/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(data.table)
+library(sf)
+library(tmap)
+library(caret)
+library(e1071)
+library(cluster)
+library(pracma)
+library(xtable)
+library(ggsci)
+library(gridExtra)
+library(tableone)
+paleta15 <- c("#F5CC62", "#C5AB8A", "#999B52", "#D5CB72", "#761131", "#17939B", "#142E53", "#1788AA", "#AED0E9", "#582C29", "#E53F25", "#F48B6B", "#FAAF5E", "#F9C6CB", "#CCC2DB")
+paleta.bien.mal <- c("#999B52", "#E53F25")
+paleta2 <- c("#F5CC62", "#17939B")
+```
+
+# TP AID
+
+Construcción de mapas:
+
+```{r mapas}
+manzanas <- read_sf("data/Manzana_final/manzana_voronoi_distancias.shp")
+
+codigos.nombres <- data.frame(codigo = c("prv", "hsp", "edc", "com", "bmb", "homic", "hurto", "lesion", "robo"),
+                              nombre = c("Establecimiento de salud privado", "Hospital público", "Establecimiento educativo", "Comisaría", "Cuartel de bomberos", "Homicidios", "Hurtos", "Lesiones", "Robos"))
+
+
+
+tmap_mode("plot")
+
+for(i in 1:nrow(codigos.nombres[1:5,])){
+  columna <- paste0("dist_", codigos.nombres[i, "codigo"])
+  titulo <- codigos.nombres[i, "nombre"]#paste0("Distancia a ", codigos.nombres[i, "nombre"], " más cercano")
+  mapa <- tm_shape(manzanas) +
+  tm_fill(columna, title = "Distancia a más cercano (Km)", n = 10, legend.format = list(text.separator = "-")) + #aca le pones con que atributo de la info que se subio antes queres que se pinte
+  tm_borders(lwd = 0.5) +
+  tm_layout(title = titulo, legend.outside = TRUE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar()
+  tmap_save(mapa, paste0("Imagenes/mapa_", titulo, ".png"), dpi = 300)
+  print(mapa)
+}
+
+for(i in 6:9){
+  columna <- codigos.nombres[i, "codigo"]
+  titulo <- codigos.nombres[i, "nombre"] #paste0("Número de ", codigos.nombres[i, "nombre"], " en la manzana")
+  mapa <- tm_shape(manzanas) +
+  tm_fill(columna, title = "Cantidad en manzana", n = 10, legend.format = list(text.separator = "-")) + #aca le pones con que atributo de la info que se subio antes queres que se pinte
+  tm_borders(lwd = 0.5) +
+  tm_layout(title = titulo, legend.outside = TRUE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar()
+  tmap_save(mapa, paste0("Imagenes/mapa_", titulo, ".png"), dpi = 300)
+  print(mapa)
+}
+
+manzanas$departamen <- factor(manzanas$departamen, levels = paste("Comuna", 1:15, sep = " "))
+mapa.comunas <- tm_shape(manzanas) +
+  tm_fill("departamen", title = "Comunas", palette = paleta15) + #aca le pones con que atributo de la info que se subio antes queres que se pinte
+  tm_borders(lwd = 0.5) +
+  tm_layout(legend.outside = TRUE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar()
+  tmap_save(mapa.comunas, paste0("Imagenes/mapa_comunas", ".png"), dpi = 300)
+  print(mapa.comunas)
+
+```
+Conteo de manzanas por comuna: 
+
+```{r}
+manzanas %>%
+  st_drop_geometry() %>%
+  count(departamen) %>%
+  arrange(n)
+```
+
+### Análisis y clasificaciones:
+Se realizó un una tabla con métricas resumen para cada una de las variables en cuestión.
+Se realizaron boxplots que permiten resumir el comportamiento de las variables en cuestión
+```{r bxplots}
+df <- read_sf("data/Manzana_final/manzana_voronoi_distancias.shp") %>%
+  st_drop_geometry() %>%
+  setDT()
+
+df[, log_dist_edc := log(dist_edc)]
+
+df$dist_edc <- NULL
+
+df.long <- melt(df, id.vars = c('id_mnz', 'departamen'), 
+     measure.vars = list(variable = names(df)[grepl("dist", x = names(df), fixed = TRUE)]))
+
+bxp1 <- df.long %>%
+  mutate(departamen = paste0(substr(departamen, 1, 1), gsub("Comuna ", "", departamen, fixed = TRUE)),
+         departamen = factor(departamen, levels = paste0("C", 1:15))) %>%
+  ggplot(aes(x = departamen, y = value, col = departamen)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(variable~., scales = "free")
+
+bxp1
+
+df.long.2 <- melt(df, id.vars = c('id_mnz', 'departamen'), 
+                measure.vars = list(variable = c("homic", "hurto", "lesion", "robo")))
+
+bxp2 <- df.long.2 %>%
+  mutate(#value = log(value + 0.01),
+         departamen = paste0(substr(departamen, 1, 1), gsub("Comuna ", "", departamen, fixed = TRUE)),
+         departamen = factor(departamen, levels = paste0("C", 1:15))) %>%
+  ggplot(aes(x = departamen, y = value, col = departamen)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(variable~., scales = "free")
+
+bxp2
+
+funcion_bxp <- function(variable.x, etiqueta){
+  df <- rbind(df.long, df.long.2) %>%
+  filter(variable == variable.x) %>%
+  mutate(#value = log(value + 0.01),
+         departamen = paste0(substr(departamen, 1, 1), gsub("Comuna ", "", departamen, fixed = TRUE)),
+         departamen = factor(departamen, levels = paste0("C", 1:15))) %>%
+  mutate(variable = case_when(variable == "dist_prv" ~ "Establecimiento de Salud Privado",
+                              variable == "dist_hsp" ~ "Hospital Público",
+                              variable == "dist_com" ~ "Comisaría",
+                              variable == "dist_bmb" ~ "Cuartel",
+                              variable == "log_dist_edc" ~ "Establecimiento Educativo (Log)",
+                              variable == "homic" ~ "Homicidios",
+                              variable == "hurto" ~ "Hurtos",
+                              variable == "lesion" ~ "Lesiones",
+                              variable == "robo" ~ "Robos"))
+  
+  ggplot(df, aes(x = departamen, y = value, col = departamen)) +
+  geom_boxplot(show.legend = FALSE) +
+  ggtitle(unique(df$variable)) +
+  theme_classic() +
+    theme(axis.text.x = element_text(size = 7), plot.title = element_text(size = 9, face = "bold")) +
+  scale_color_manual(values = paleta15) +
+  ylab(etiqueta) +
+    xlab("Comuna")
+}
+bxp.prv <- funcion_bxp("dist_prv", "Distancia (Km)")
+bxp.hsp <- funcion_bxp("dist_hsp", "Distancia (Km)")
+bxp.com <- funcion_bxp("dist_com", "Distancia (Km)")
+bxp.hurto <- funcion_bxp("hurto", "Cantidad")
+
+conjunto <- grid.arrange(bxp.prv, bxp.hsp, bxp.com, bxp.hurto, ncol = 2, nrow = 2)
+
+ggsave("Imagenes/boxplot_descriptiva.png", conjunto, dpi = 300)
+
+ggsave("Imagenes/boxplot_prv.png", bxp.prv, dpi = 300, height = 5, width = 7)
+ggsave("Imagenes/boxplot_hsp.png", bxp.hsp, dpi = 300, height = 5, width = 7)
+ggsave("Imagenes/boxplot_com.png", bxp.com, dpi = 300, height = 5, width = 7)
+ggsave("Imagenes/boxplot_hurto.png", bxp.hurto, dpi = 300, height = 5, width = 7)
+
+
+tabla.resumen <- rbind(df.long, df.long.2)[, .(Media = round(mean(value), 2),
+                              Mediana = round(median(value), 2),
+                              IQR = paste0("[", round(quantile(value)[[2]], 2), " ; ", round(quantile(value)[[4]], 2), "]"),
+                              Mínimo = round(min(value), 2),
+                              Máximo = round(max(value), 2)), by = variable] %>%
+  mutate(variable = case_when(variable == "dist_prv" ~ "Distancia a Est. Salud Privado",
+                              variable == "dist_hsp" ~ "Distancia a Hospital Público",
+                              variable == "dist_com" ~ "Distancia a Comisaría",
+                              variable == "dist_bmb" ~ "Distancia a Cuartel",
+                              variable == "log_dist_edc" ~ "Distancia a Est. Educativo (Log)",
+                              variable == "homic" ~ "Homicidios",
+                              variable == "hurto" ~ "Hurtos",
+                              variable == "lesion" ~ "Lesiones",
+                              variable == "robo" ~ "Robos"))
+tabla.resumen
+print(xtable(tabla.resumen, type = "latex"), file = "Imagenes/Tabla resumen variables.tex")
+```
+Se realizó una clasificacion supervisada mediante el algoritmo SVM y se cuantificó la performance del modelo mediante un cross-validation con accuracy ponderada por la inversa de la proporción de manzanas en cada comuna.
+
+```{r entrenamiento_svm}
+df <- read_sf("data/Manzana_final/manzana_voronoi_distancias.shp") %>%
+  st_drop_geometry() %>%
+  setDT()
+df[, log_dist_edc := log(dist_edc)]
+df$dist_edc <- NULL
+df <- df[, .(homic, hurto, lesion, robo, dist_prv, dist_hsp, dist_com, dist_bmb, log_dist_edc, departamen)]
+col.int <- names(df)[sapply(df, is.integer)]
+df.int <- sapply(df[, ..col.int], as.numeric)
+df <- cbind(df.int, df[, -..col.int])
+df[, departamen := gsub(" ", "_", departamen)]
+df$departamen <- factor(df$departamen, levels = paste("Comuna", 1:15, sep = "_"))
+
+particion <- createDataPartition(df$departamen, p = 0.75, list = FALSE)
+train <- df[particion,]
+test <- df[-particion,]
+
+gammas <- c(1/4, 1/3, 1/2, 1:10) * 1/ncol(train)
+accuracys.radial <- c()
+pesos.train <- nrow(train)/table(train$departamen)
+pesos.test <- nrow(test)/table(test$departamen)
+
+for(i in gammas){
+  cat("va por", i, "\n")
+  modelo_svm_loop <- svm(departamen~., data = train, kernel = "radial", gamma = i, cross = 10, class.weights = pesos.train)
+  accuracys.radial <- c(accuracys.radial, modelo_svm_loop$tot.accuracy)
+}
+
+resultado.entrenamiento <- data.frame(gamma  = gammas, exactitud = accuracys.radial)
+
+write.csv(resultado.entrenamiento, "resultado_entrenamiento.csv")
+
+resultado.entrenamiento %>%
+  ggplot(aes(x = gamma, y = exactitud)) +
+  geom_line() +
+  geom_point()
+
+```
+Resultados de la clasificacion supervisada:
+
+```{r entrenamiento_svm}
+mejor.gamma <- 0.3 #gammas[which(accuracys.radial == max(accuracys.radial))] #0.3
+
+modelo_final <- svm(departamen~., data = train, kernel = "radial", gamma = mejor.gamma, class.weights = pesos.test)
+
+summary(modelo_final)
+
+predichos <- predict(modelo_final, test)
+cm <- confusionMatrix(predichos, reference = test$departamen)
+cm
+
+cm.df <- as.data.frame(cm$table)
+confusion <- cm.df %>%
+  mutate(Prediction = gsub("Comuna_", "C", Prediction, fixed = TRUE) %>%
+           factor(levels = rev(paste0("C", 1:15))),
+         Reference = gsub("Comuna_", "C", Reference, fixed = TRUE) %>%
+           factor(levels = paste0("C", 1:15))) %>%
+  ggplot(aes(x = Reference, y = Prediction, fill = Freq, label = Freq)) +
+  geom_tile(color= "white",size=0.1) +
+  geom_text() +
+  scale_x_discrete(position = "top")  +
+  xlab("Observados") +
+  ylab("Predichos") +
+  theme_classic() +
+  scale_fill_gradient(low=paleta2[1], high=paleta2[2], name = "Frecuencia")
+
+confusion
+
+ggsave("Imagenes/Matriz_confusion.png", confusion)
+
+```
+Mapas de resultados de la clasificacion supervisada: 
+
+```{r mapas_svm}
+predichos <- predict(modelo_final, df)
+manzanas$pred <- factor(gsub("_", " ", predichos, fixed = TRUE), levels = paste("Comuna", 1:15, sep = " "))
+manzanas$departamen <- factor(manzanas$departamen, levels = paste("Comuna", 1:15, sep = " "))
+
+mapa.pred <- tm_shape(manzanas) +
+  tm_fill("pred", title = "Comunas predichas", palette = paleta15) + #aca le pones con que atributo de la info que se subio antes queres que se pinte
+  tm_borders(lwd = 0.5) +
+  tm_layout(legend.outside = TRUE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar()
+
+tmap_save(mapa.pred, "Imagenes/mapa_predichos.png", dpi = 300)
+print(mapa.pred)
+
+manzanas$bien_clasificado <- manzanas$departamen == manzanas$pred
+
+mapa.bien <- manzanas %>%
+  mutate(bien_clasificado = if_else(bien_clasificado, "Manzanas bien clasificadas", "Manzanas mal clasificadas")) %>%
+  tm_shape() +
+  tm_fill("bien_clasificado", title = "Resultados SVM", palette = paleta.bien.mal) + #aca le pones con que atributo de la info que se subio antes queres que se pinte
+  tm_borders(lwd = 0.5) +
+  tm_layout(legend.outside = TRUE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar()
+
+tmap_save(mapa.bien, "Imagenes/mapa_buena_clasificacion.png", dpi = 300)
+
+print(mapa.bien)
+
+```
+Clasificador al azar, solo para comparar resultados con el clasificador SVM:
+
+```{r azar}
+medias <- c()
+for(i in 1:1000){
+  pred.azar <- sample(df$departamen, size = nrow(df), replace = TRUE)
+  medias <- c(medias, mean(pred.azar == df$departamen))
+}
+mean(medias)
+
+t.test(medias)$conf.int
+
+((0.6833/mean(medias))-1)*100
+
+```
+## Clasificacion no supervisada con PAM:
+Determinación de cantidad óptima de clusters:
+```{r seleccion_k}
+manzanas <- read_sf("data/Manzana_final/manzana_voronoi_distancias.shp")
+
+df2 <- manzanas %>%
+  st_drop_geometry() %>%
+  setDT()
+
+df2[, log_dist_edc := log(dist_edc)]
+
+df2$dist_edc <- NULL
+
+df2 <- df2[, .(homic, hurto, lesion, robo, dist_prv, dist_hsp, dist_com, dist_bmb, log_dist_edc, departamen)]
+
+col.int <- names(df2)[sapply(df2, is.integer)]
+
+df2.int <- sapply(df2[, ..col.int], as.numeric)
+
+df2 <- cbind(df2.int, df2[, -..col.int])
+
+df2[, departamen := gsub(" ", "_", departamen)]
+
+df2$departamen <- factor(df2$departamen, levels = paste("Comuna", 1:15, sep = "_"))
+
+metrica = function(datA_esc,kmax,f) {
+  
+  sil = array()
+  sse = array()
+  
+  datA_dist= dist(datA_esc,method = "euclidean", diag = FALSE, upper = FALSE, p = 2)
+  for ( i in  2:kmax) {
+    cat("va por ", i, "\n")
+    if (strcmp(f,"kmeans")==TRUE) {   #centroide: tipico kmeans
+      CL  = kmeans(datA_esc, centers=i, nstart=50,iter.max = kmax)
+      sse[i]  = CL$tot.withinss 
+      CL_sil = silhouette(CL$cluster, datA_dist)
+      sil[i]  = summary(CL_sil)$avg.width
+    }
+    if (strcmp(f,"pam")==TRUE){       #medoide: ojo porque este metodo tarda muchisimo 
+      CL = pam(x=datA_esc, k=i, diss = F, metric = "euclidean")
+      sse[i]  = CL$objective[1] 
+      sil[i]  = CL$silinfo$avg.width
+    }
+  }
+  sse
+  sil
+  return(data.frame(sse,sil))
+}
+
+
+#2 opciones de escalamiento
+kmax <- 10
+m1 <- metrica(scale(df2[, -c("departamen")]), kmax, "pam")  #tipica con estimadores de la normal
+
+windows()
+par(mfrow=c(2,1))
+plot(2:kmax, m1$sil[2:kmax],col=1,type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="sil") 
+
+plot(2:kmax, m1$sse[2:kmax],type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="sse") 
+
+par(mfrow=c(1,1))
+grid()
+
+
+silueta <- m1 %>%
+  filter(!is.na(sse)) %>%
+  mutate(k = 2:kmax) %>%
+  pivot_longer(!k, names_to = "metrica", values_to = "value") %>%
+  mutate(metrica = if_else(metrica == "sse", "SSE", "SIL")) %>%
+  ggplot(aes(x = k, y = value)) +
+  geom_line() +
+  geom_point() +
+  theme_classic() +
+  ylab("Valor de la métrica") +
+  xlab("Número de clusters") +
+  facet_wrap(metrica~., scales = "free_y", nrow = 2)
+
+silueta
+
+ggsave("Imagenes/Resultados_silueta.png", silueta)
+
+```
+Clasificación no supervisada con 2 clusters:
+```{r clasificacion_ns}
+
+cantidad_clusters <- 2
+
+CL <- pam(scale(df2[, -c("departamen")]), k = cantidad_clusters, diss = F, metric = "euclidean")
+
+manzanas$pam <- factor(paste0("Cluster ", CL$cluster), levels = paste0("Cluster ", 1:cantidad_clusters))
+
+mapa.pam <- tm_shape(manzanas) +
+  tm_fill("pam", title = "Agrupación no supervisada (PAM)", palette = rev(paleta2)) + #aca le pones con que atributo de la info que se subio antes queres que se pinte
+  tm_borders(lwd = 0.5) +
+  tm_layout(legend.outside = TRUE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar()
+
+tmap_save(mapa.pam, "Imagenes/mapa_pam.png", dpi = 300)
+
+print(mapa.pam)
+
+```
+
+Suavizado espacial:
+
+```{r}
+
+modelo <- svm(pam ~ lat_mnz * lon_mnz, data = st_drop_geometry(manzanas), kernel = "radial", gamma = 10)
+
+manzanas2 <- manzanas
+
+manzanas2$pred <- predict(modelo)
+
+manzanas2 <- manzanas2 %>%
+  group_by(pred) %>%
+  summarise(n = n())
+
+write_sf(manzanas2, "data/Final smooth/final_smooth.shp")
+
+mapa.suave <- manzanas2 %>%
+  tm_shape() +
+  tm_fill("pred", title = "Agrupación no supervisada (PAM) suavizada", palette = rev(paleta2)) + #aca le pones con que atributo de la info que se subio antes queres que se pinte
+  tm_borders(lwd = 0.5) +
+  tm_layout(legend.outside = TRUE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar()
+
+tmap_save(mapa.suave, "Imagenes/mapa_suave.png", dpi = 300)
+
+print(mapa.suave)
+
+```
+
+
+Análisis de las variables de los clusters: Construcción de tabla resumen
+
+
+```{r pressure, echo=FALSE}
+df3 <- df2
+df3$id_mnz <- manzanas$id_mnz
+df3$pam <- manzanas$pam
+df3$departamen <- NULL
+
+df3.long <- melt(df3, id.vars = c('id_mnz', 'pam'), 
+     measure.vars = list(variable = names(df3)[grepl("dist", x = names(df3), fixed = TRUE)]))
+
+bxp1 <- df3.long %>%
+  ggplot(aes(x = pam, y = value, col = pam)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(variable~., scales = "free")
+
+bxp1
+
+df3.long.2 <- melt(df3, id.vars = c('id_mnz', 'pam'), 
+                measure.vars = list(variable = c("homic", "hurto", "lesion", "robo")))
+
+bxp2 <- df3.long.2 %>%
+  ggplot(aes(x = pam, y = value, col = pam)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(variable~., scales = "free")
+
+bxp2  
+
+df3.long.2 %>%
+  mutate(value = case_when(value == 0 ~ "0",
+                           value > 0 & value <= 2 ~ "1-2",
+                           value > 2 & value <= 10 ~ "3-10",
+                           value > 10 ~ "> 10") %>%
+           factor(levels = c("0", "1-2", "3-10", "> 10"))) %>%
+  count(pam, variable, value) %>%
+  group_by(pam, variable) %>%
+  mutate(prop = 100 * n / sum(n)) %>%
+  ggplot(aes(x = pam, y = prop, fill = value)) +
+  geom_col(position = "stack") +
+  theme_classic() +
+  facet_grid(variable~.)
+  
+  
+
+
+  
+tabla.resumen <- rbind(df3.long, df3.long.2) %>%
+  mutate(variable = case_when(variable == "dist_prv" ~ "Distancia a Est. Salud Privado",
+                              variable == "dist_hsp" ~ "Distancia a Hospital Público",
+                              variable == "dist_com" ~ "Distancia a Comisaría",
+                              variable == "dist_bmb" ~ "Distancia a Cuartel",
+                              variable == "log_dist_edc" ~ "Distancia a Est. Educativo (Log)",
+                              variable == "homic" ~ "Homicidios",
+                              variable == "hurto" ~ "Hurtos",
+                              variable == "lesion" ~ "Lesiones",
+                              variable == "robo" ~ "Robos"))
+
+names(df3) <- case_when(names(df3) == "dist_prv" ~ "Distancia a Est. Salud Privado",
+                              names(df3) == "dist_hsp" ~ "Distancia a Hospital Público",
+                              names(df3) == "dist_com" ~ "Distancia a Comisaría",
+                              names(df3) == "dist_bmb" ~ "Distancia a Cuartel",
+                              names(df3) == "log_dist_edc" ~ "Distancia a Est. Educativo (Log)",
+                              names(df3) == "homic" ~ "Homicidios",
+                              names(df3) == "hurto" ~ "Hurtos",
+                              names(df3) == "lesion" ~ "Lesiones",
+                              names(df3) == "robo" ~ "Robos")
+  
+
+variables <- names(df3)[!names(df3) %in% c("pam", "id_mnz")]
+tablauno <- CreateTableOne(vars = variables, strata = "pam" , data = df3, test = FALSE)
+no.normales <- c("Hurtos", "Lesiones", "Homicidos", "Robos")
+print(tablauno, nonnormal = variables)
+print(xtable(print(tablauno, nonnormal = variables), type = "latex"), file = "Imagenes/Tabla pam variables.tex")
+
+```
+
